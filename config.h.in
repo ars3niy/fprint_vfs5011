@@ -54,6 +54,9 @@
 /* Build Validity VFS301/VFS300 driver */
 #undef ENABLE_VFS301
 
+/* Build Validity VFS5011 driver */
+#undef ENABLE_VFS5011
+
 /* Define to 1 if you have the <dlfcn.h> header file. */
 #undef HAVE_DLFCN_H
 
