@@ -246,7 +246,7 @@ int vfs5011_init(libusb_device_handle *handle)
 	
 	SEND(vfs5011_init_18);
 	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_CTRL2, 8); //00D3054000
+	// RECV(VFS5011_IN_ENDPOINT_CTRL2, 8); //00D3054000
 	dump(receive_buf, received);
 	
 	return 0;
