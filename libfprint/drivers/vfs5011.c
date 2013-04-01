@@ -14,7 +14,6 @@
 #ifdef DEBUG
 #include <time.h>
 FILE *debuglogfile = NULL;
-struct timeval log_start_time;
 #endif
 
 static char *get_debugfiles_path()
@@ -28,20 +27,20 @@ static char *get_debugfiles_path()
 
 static void debugprint(const char *line)
 {
+	fp_dbg(line);
 #ifdef DEBUG
 	char *debugpath = get_debugfiles_path();
 	if ((debuglogfile == NULL) && (debugpath != NULL)) {
 		char name[1024];
 		sprintf(name, "%s/debug%d.log", debugpath, (int)time(NULL));
 		debuglogfile = (FILE *)fopen(name, "w");
-		gettimeofday(&log_start_time, NULL);
 	}
 	if (debuglogfile != NULL) {
 		struct timeval t;
 		gettimeofday(&t, NULL);
-		int diff = 1000 * (t.tv_sec - log_start_time.tv_sec) + (t.tv_usec - log_start_time.tv_usec)/1000;
-		fprintf(debuglogfile, "%d.%3d\t", diff/1000, diff % 1000);
+		fprintf(debuglogfile, "%d.%.3d\t", t.tv_sec, t.tv_usec/1000);
 		fputs(line, debuglogfile);
+		fputc('\n', debuglogfile);
 	}
 #endif
 }
@@ -78,15 +77,15 @@ static int usb_send(libusb_device_handle *handle, unsigned char *data, unsigned 
 	int r = libusb_bulk_transfer(handle, VFS5011_OUT_ENDPOINT, data, size,
 	                                    &transferred, VFS5011_DEFAULT_WAIT_TIMEOUT);
 	if (r < 0) {
-		debug("usb_send: bulk transfer returned %d\n", r);
+		debug("usb_send: bulk transfer returned %d", r);
 		return r;
 	}
 	
 	if (transferred != size) {
-		debug("usb_send: transfered %d out of %d\n", transferred, size);
+		debug("usb_send: transfered %d out of %d", transferred, size);
 		return -1;
 	}
-	debug("size=%d transferred = %d\n", size, transferred);
+	debug("size=%d transferred = %d", size, transferred);
 	return 0;
 }
 
@@ -96,40 +95,40 @@ static int usb_recv(libusb_device_handle *handle, unsigned endpoint, unsigned ch
 	int r = libusb_bulk_transfer(handle, endpoint, buf, max_bytes, transferred,
 	                             VFS5011_DEFAULT_WAIT_TIMEOUT);
 	if (r < 0) {
-		debug("usb_recv: bulk transfer returned %d\n", r);
+		debug("usb_recv: bulk transfer returned %d", r);
 		return r;
 	}
-	debug("usb_recv: got %d out of %d\n", *transferred, max_bytes);
+	debug("usb_recv: got %d out of %d", *transferred, max_bytes);
 	return 0;
 }
 
 #define SEND(command) \
-	debug("Sending " #command "\n"); \
+	debug("Sending " #command ""); \
 	if (usb_send(handle, command, sizeof(command)) != 0) { \
-		debug(#command " failed\n"); \
+		debug(#command " failed"); \
 		return -1; \
 	}
 
 #define RECV(endpoint, size) \
-	debug("Receiving %d bytes\n", size); \
+	debug("Receiving %d bytes", size); \
 	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		debug("Failed to receive " #size " from " #endpoint "\n"); \
+		debug("Failed to receive " #size " from " #endpoint ""); \
 		return -1; \
 	} \
 
 #define RECV_CHECK(endpoint, size, expected) \
-	debug("Receiving %d bytes\n", size); \
+	debug("Receiving %d bytes", size); \
 	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		debug("Failed to receive " #size " from " #endpoint "\n"); \
+		debug("Failed to receive " #size " from " #endpoint ""); \
 		return -1; \
 	} \
 	if ( (received != sizeof(expected)) || \
 	     (memcmp(receive_buf, expected, sizeof(expected)) != 0) ) { \
-		debug("Receiving " #size " from " #endpoint " got wrong reply:\n"); \
+		debug("Receiving " #size " from " #endpoint " got wrong reply:"); \
 		dump(receive_buf, received); \
 		return -1; \
 	} else \
-		debug("Receiving " #size " from " #endpoint " correct reply\n");
+		debug("Receiving " #size " from " #endpoint " correct reply");
 
 // This is done when the device is plugged in, but it doesn't harm
 // to do this every time before scanning the image
@@ -534,7 +533,7 @@ enum {
 
 static void capture_init(struct vfs5011_data *data, int max_captured, int max_recorded)
 {
-	debug("capture_init\n");
+	debug("capture_init");
 	data->lastline = NULL;
 	data->lines_captured = 0;
 	data->lines_recorded = 0;
@@ -554,7 +553,7 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 		STOP_CHECK_LINES = 50
 	};
 
-	debug("process_chunk: got %d bytes\n", transferred);
+	debug("process_chunk: got %d bytes", transferred);
 	int lines_captured = transferred/VFS5011_LINE_SIZE;
 	int remainder = transferred % VFS5011_LINE_SIZE;
 	int i;
@@ -581,13 +580,13 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 		} else
 			data->empty_lines = 0;
 		if (data->empty_lines >= STOP_CHECK_LINES) {
-			debug("process_chunk: got %d empty lines, finishing\n", data->empty_lines);
+			debug("process_chunk: got %d empty lines, finishing", data->empty_lines);
 			return 1;
 		}
 		
 		data->lines_captured++;
 		if (data->lines_captured > data->max_lines_captured) {
-			debug("process_chunk: captured %d lines, finishing\n", data->lines_captured);
+			debug("process_chunk: captured %d lines, finishing", data->lines_captured);
 			return 1;
 		}
 		
@@ -597,7 +596,7 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 			memmove(data->lastline, linebuf, VFS5011_LINE_SIZE);
 			data->lines_recorded++;
 			if (data->lines_recorded >= data->max_lines_recorded) {
-				debug("process_chunk: recorded %d lines, finishing\n", data->lines_recorded);
+				debug("process_chunk: recorded %d lines, finishing", data->lines_recorded);
 				return 1;
 			}
 		}
@@ -684,7 +683,7 @@ void submit_image(struct fpi_ssm *ssm, struct vfs5011_data *data)
 	img->height = height;
 	memmove(img->data, data->rescale_buffer, VFS5011_IMAGE_WIDTH * height);
 	
-	debug("Image captured, commiting\n");
+	debug("Image captured, commiting");
 #ifdef DEBUG
 	if (debuglogfile != NULL) {
 		fclose(debuglogfile);
@@ -722,7 +721,7 @@ static void chunk_capture_callback(struct libusb_transfer *transfer)
 static int capture_chunk_async(struct vfs5011_data *data, libusb_device_handle *handle, int nline,
                                int timeout, struct fpi_ssm *ssm)
 {
-	debug("capture_chunk_async: capture %d lines, already have %d\n", nline, data->lines_recorded);
+	debug("capture_chunk_async: capture %d lines, already have %d", nline, data->lines_recorded);
 	enum {
 		DEVIATION_THRESHOLD = 15*15,
 		DIFFERENCE_THRESHOLD = 600,
@@ -751,7 +750,7 @@ static void main_loop(struct fpi_ssm *ssm)
 	int r;
 	struct fpi_timeout *timeout;
 	
-	debug("main_loop: state %d\n", ssm->cur_state);
+	debug("main_loop: state %d", ssm->cur_state);
 	
 	switch (ssm->cur_state) {
 	case M_REQUEST_FPRINT:
@@ -787,7 +786,7 @@ static void main_loop(struct fpi_ssm *ssm)
 		break;
 	
 	case M_FINISHED:
-		debug("finishing\n");
+		debug("finishing");
 		vfs5011_prepare(dev->udev);
 		submit_image(ssm, data);
 		fpi_imgdev_report_finger_status(dev, FALSE);
@@ -798,7 +797,7 @@ static void main_loop(struct fpi_ssm *ssm)
 
 static void main_loop_complete(struct fpi_ssm *ssm)
 {
-// 	debug("completing state machine\n");
+// 	debug("completing state machine");
 	fpi_ssm_free(ssm);
 }
 
@@ -856,21 +855,21 @@ static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 		fp_err("Failed to initialize the device");
 		return r;
 	}
-	debug("device initialized\n");
+	debug("device initialized");
 	fpi_imgdev_activate_complete(dev, 0);
-	debug("creating ssm\n");
+	debug("creating ssm");
 	ssm = fpi_ssm_new(dev->dev, main_loop, M_LOOP_NUM_STATES);
 	ssm->priv = dev;
-	debug("starting ssm\n");
+	debug("starting ssm");
 	fpi_ssm_start(ssm, main_loop_complete);
-	debug("ssm done, getting out\n");
+	debug("ssm done, getting out");
 
 	return 0;
 }
 
 static void dev_deactivate(struct fp_img_dev *dev)
 {
-// 	debug("deactivating\n");
+// 	debug("deactivating");
 	libusb_release_interface(dev->udev, 0);
 	fpi_imgdev_deactivate_complete(dev);
 }
