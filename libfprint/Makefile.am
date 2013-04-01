@@ -17,7 +17,6 @@ FDU2000_SRC = drivers/fdu2000.c
 VCOM5S_SRC = drivers/vcom5s.c
 VFS101_SRC = drivers/vfs101.c
 VFS301_SRC = drivers/vfs301.c drivers/vfs301_proto.c  drivers/vfs301_proto.h drivers/vfs301_proto_fragments.h
-VFS5011_SRC = drivers/vfs5011.c drivers/vfs5011_proto.h
 
 EXTRA_DIST = \
 	$(UPEKE2_SRC)		\
@@ -35,7 +34,6 @@ EXTRA_DIST = \
 	$(VCOM5S_SRC)		\
 	$(VFS101_SRC)		\
 	$(VFS301_SRC)		\
-	$(VFS5011_SRC)		\
 	drivers/aesx660.c	\
 	drivers/aesx660.h	\
 	drivers/driver_ids.h	\
@@ -157,10 +155,6 @@ endif
 
 if ENABLE_VFS301
 DRIVER_SRC += $(VFS301_SRC)
-endif
-
-if ENABLE_VFS5011
-DRIVER_SRC += $(VFS5011_SRC)
 endif
 
 if REQUIRE_IMAGEMAGICK
