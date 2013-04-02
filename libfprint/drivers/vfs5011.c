@@ -12,9 +12,7 @@
 #define DEBUG
 
 #ifdef DEBUG
-#include <time.h>
 FILE *debuglogfile = NULL;
-struct timeval log_start_time;
 #endif
 
 static char *get_debugfiles_path()
@@ -34,15 +32,9 @@ static void debugprint(const char *line)
 		char name[1024];
 		sprintf(name, "%s/debug%d.log", debugpath, (int)time(NULL));
 		debuglogfile = (FILE *)fopen(name, "w");
-		gettimeofday(&log_start_time, NULL);
 	}
-	if (debuglogfile != NULL) {
-		struct timeval t;
-		gettimeofday(&t, NULL);
-		int diff = 1000 * (t.tv_sec - log_start_time.tv_sec) + (t.tv_usec - log_start_time.tv_usec)/1000;
-		fprintf(debuglogfile, "%d.%3d\t", diff/1000, diff % 1000);
+	if (debuglogfile != NULL)
 		fputs(line, debuglogfile);
-	}
 #endif
 }
 
