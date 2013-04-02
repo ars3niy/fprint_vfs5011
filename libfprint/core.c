@@ -24,7 +24,6 @@
 
 #include <glib.h>
 #include <libusb.h>
-#include <time.h>
 
 #include "fp_internal.h"
 
@@ -319,11 +318,8 @@ void fpi_log(enum fpi_log_level level, const char *component,
 		prefix = "unknown";
 		break;
 	}
-	
-	struct timeval t;
-	gettimeofday(&t, NULL);
 
-	fprintf(stream, "%d.%.3d %s:%s [%s] ", t.tv_sec, t.tv_usec/1000, component ? component : "fp", prefix,
+	fprintf(stream, "%s:%s [%s] ", component ? component : "fp", prefix,
 		function);
 
 	va_start (args, format);
