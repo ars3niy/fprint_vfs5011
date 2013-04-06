@@ -6,52 +6,22 @@
 #include <libusb.h>
 #include <unistd.h>
 #include <fp_internal.h>
+#include "driver_ids.h"
 
 #include "vfs5011_proto.h"
 
-#define DEBUG
-
-#ifdef DEBUG
-FILE *debuglogfile = NULL;
-#endif
-
-static char *get_debugfiles_path()
+static char *get_debugfiles_path(void)
 {
-#ifdef DEBUG
+#ifdef ENABLE_DEBUG_LOGGING
 	return getenv("VFS5011_DEBUGPATH");
 #else
 	return NULL;
 #endif
 }
 
-static void debugprint(const char *line)
-{
-#ifdef DEBUG
-	char *debugpath = get_debugfiles_path();
-	if ((debuglogfile == NULL) && (debugpath != NULL)) {
-		char name[1024];
-		sprintf(name, "%s/debug%d.log", debugpath, (int)time(NULL));
-		debuglogfile = (FILE *)fopen(name, "w");
-	}
-	if (debuglogfile != NULL)
-		fputs(line, debuglogfile);
-#endif
-}
-
-static void debug(const char *msg, ...)
-{
-#ifdef DEBUG
-	char s[1024];
-	va_list ap;
-	va_start(ap, msg);
-	vsnprintf(s, sizeof(s)-1, msg, ap);
-	debugprint(s);
-#endif
-}
-
 static void dump(const unsigned char *buf, int size)
 {
-#ifdef DEBUG
+#ifdef ENABLE_DEBUG_LOGGING
 	char *s = (char *)malloc(size * 5 + 4);
 	s[0] = '\0';
 	int i;
@@ -60,7 +30,7 @@ static void dump(const unsigned char *buf, int size)
 		sprintf(t, "0x%x ", buf[i]);
 		strcat(s, t);
 	}
-	debugprint(s);
+	fp_dbg(s);
 #endif
 }
 
@@ -70,15 +40,15 @@ static int usb_send(libusb_device_handle *handle, unsigned char *data, unsigned 
 	int r = libusb_bulk_transfer(handle, VFS5011_OUT_ENDPOINT, data, size,
 	                                    &transferred, VFS5011_DEFAULT_WAIT_TIMEOUT);
 	if (r < 0) {
-		debug("usb_send: bulk transfer returned %d\n", r);
+		fp_dbg("usb_send: bulk transfer returned %d", r);
 		return r;
 	}
 	
 	if (transferred != size) {
-		debug("usb_send: transfered %d out of %d\n", transferred, size);
+		fp_dbg("usb_send: transfered %d out of %d", transferred, size);
 		return -1;
 	}
-	debug("size=%d transferred = %d\n", size, transferred);
+	fp_dbg("size=%d transferred = %d", size, transferred);
 	return 0;
 }
 
@@ -88,54 +58,45 @@ static int usb_recv(libusb_device_handle *handle, unsigned endpoint, unsigned ch
 	int r = libusb_bulk_transfer(handle, endpoint, buf, max_bytes, transferred,
 	                             VFS5011_DEFAULT_WAIT_TIMEOUT);
 	if (r < 0) {
-		debug("usb_recv: bulk transfer returned %d\n", r);
+		fp_dbg("usb_recv: bulk transfer returned %d", r);
 		return r;
 	}
-	debug("usb_recv: got %d out of %d\n", *transferred, max_bytes);
+	fp_dbg("usb_recv: got %d out of %d", *transferred, max_bytes);
 	return 0;
 }
 
 #define SEND(command) \
-	debug("Sending " #command "\n"); \
+	fp_dbg("Sending " #command ""); \
 	if (usb_send(handle, command, sizeof(command)) != 0) { \
-		debug(#command " failed\n"); \
+		fp_dbg(#command " failed"); \
 		return -1; \
 	}
 
 #define RECV(endpoint, size) \
-	debug("Receiving %d bytes\n", size); \
+	fp_dbg("Receiving %d bytes", size); \
 	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		debug("Failed to receive " #size " from " #endpoint "\n"); \
+		fp_dbg("Failed to receive " #size " from " #endpoint ""); \
 		return -1; \
 	} \
 
 #define RECV_CHECK(endpoint, size, expected) \
-	debug("Receiving %d bytes\n", size); \
+	fp_dbg("Receiving %d bytes", size); \
 	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		debug("Failed to receive " #size " from " #endpoint "\n"); \
+		fp_dbg("Failed to receive " #size " from " #endpoint ""); \
 		return -1; \
 	} \
 	if ( (received != sizeof(expected)) || \
 	     (memcmp(receive_buf, expected, sizeof(expected)) != 0) ) { \
-		debug("Receiving " #size " from " #endpoint " got wrong reply:\n"); \
+		fp_dbg("Receiving " #size " from " #endpoint " got wrong reply:"); \
 		dump(receive_buf, received); \
 		return -1; \
 	} else \
-		debug("Receiving " #size " from " #endpoint " correct reply\n");
+		fp_dbg("Receiving " #size " from " #endpoint " correct reply");
 
 // This is done when the device is plugged in, but it doesn't harm
 // to do this every time before scanning the image
 int vfs5011_init(libusb_device_handle *handle)
 {
-	/*r = libusb_control_transfer(
-		handle, LIBUSB_REQUEST_TYPE_STANDARD, LIBUSB_REQUEST_SET_FEATURE, 
-		1, 1, NULL, 0, VFS5011_DEFAULT_WAIT_TIMEOUT
-	); 
-	if (r != 0) {
-		debug("device configuring error %d\n", r);
-		return r;
-	}*/
-
 	unsigned char receive_buf[VFS5011_RECEIVE_BUF_SIZE];
 	int received = 0;
 
@@ -246,8 +207,10 @@ int vfs5011_init(libusb_device_handle *handle)
 	
 	SEND(vfs5011_init_18);
 	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
+	
+	// Windows driver does this and it works
+	// But in this driver this call never returns...
 	// RECV(VFS5011_IN_ENDPOINT_CTRL2, 8); //00D3054000
-	dump(receive_buf, received);
 	
 	return 0;
 }
@@ -261,7 +224,6 @@ int vfs5011_prepare(libusb_device_handle *handle)
 	SEND(vfs5011_cmd_04);
 	RECV(VFS5011_IN_ENDPOINT_DATA, 64);
 	RECV(VFS5011_IN_ENDPOINT_DATA, 84032);
-	//RECV(VFS5011_IN_ENDPOINT_DATA, 84096);
 	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
 	
 	
@@ -289,7 +251,9 @@ int vfs5011_prepare(libusb_device_handle *handle)
 	SEND(vfs5011_prepare_04);
 	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 2368, VFS5011_NORMAL_CONTROL_REPLY);
 
-	//usb_recv(handle, VFS5011_IN_ENDPOINT_CTRL2, receive_buf, 8, &received);
+	// Windows driver does this and it works
+	// But in this driver this call never returns...
+	// usb_recv(handle, VFS5011_IN_ENDPOINT_CTRL2, receive_buf, 8, &received);
 	return 0;
 }
 
@@ -308,22 +272,6 @@ static int get_deviation(unsigned char *buf, int size)
 	
 	for (i = 0; i < size; i++) {
 		int dev = (int)buf[i] - mean;
-		res += dev*dev;
-	}
-	
-	return res / size;
-}
-
-static int get_deviation_int(int *buf, int size)
-{
-	int res = 0, mean = 0, i;
-	for (i = 0; i < size; i++)
-		mean += buf[i];
-	
-	mean /= size;
-	
-	for (i = 0; i < size; i++) {
-		int dev = buf[i] - mean;
 		res += dev*dev;
 	}
 	
@@ -418,7 +366,6 @@ int vfs5011_rescale_image(unsigned char *image, int input_lines,
 	float y = 0.0;
 	int line_ind = 0;
 	int *offsets = (int *)malloc(input_lines * sizeof(int));
-	int on_good_offsets = 0;
 	char name[1024];
 	char *debugpath = get_debugfiles_path();
 	FILE *debugfile = NULL;
@@ -432,20 +379,10 @@ int vfs5011_rescale_image(unsigned char *image, int input_lines,
 		int bestdiff = 0;
 		int j;
 		
-//  		if (! on_good_offsets && (i >= GOOD_OFFSETS_CRITERION)) {
-//  			if (get_deviation_int(offsets + i - GOOD_OFFSETS_CRITERION, GOOD_OFFSETS_CRITERION) <
-//  			    GOOD_OFFSETS_THRESHOLD)
-//  				on_good_offsets = 1;
-//  		}
 		
 		int firstrow, lastrow;
-//  		if (on_good_offsets) {
-//  			firstrow = i + offsets[i-1]-5;
-//  			lastrow = min(i + offsets[i-1]+5, input_lines-1);
-//  		} else {
-			firstrow = i+1;
-			lastrow = min(i + MAX_OFFSET, input_lines-1);
-//  		}
+		firstrow = i+1;
+		lastrow = min(i + MAX_OFFSET, input_lines-1);
 		
 		for (j = firstrow; j <= lastrow; j++) {
 			int diff = get_deviation2(image + i*VFS5011_LINE_SIZE + 56,
@@ -526,7 +463,7 @@ enum {
 
 static void capture_init(struct vfs5011_data *data, int max_captured, int max_recorded)
 {
-	debug("capture_init\n");
+	fp_dbg("capture_init");
 	data->lastline = NULL;
 	data->lines_captured = 0;
 	data->lines_recorded = 0;
@@ -546,9 +483,8 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 		STOP_CHECK_LINES = 50
 	};
 
-	debug("process_chunk: got %d bytes\n", transferred);
+	fp_dbg("process_chunk: got %d bytes", transferred);
 	int lines_captured = transferred/VFS5011_LINE_SIZE;
-	int remainder = transferred % VFS5011_LINE_SIZE;
 	int i;
 	
 	if (get_debugfiles_path() != NULL) {
@@ -573,13 +509,13 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 		} else
 			data->empty_lines = 0;
 		if (data->empty_lines >= STOP_CHECK_LINES) {
-			debug("process_chunk: got %d empty lines, finishing\n", data->empty_lines);
+			fp_dbg("process_chunk: got %d empty lines, finishing", data->empty_lines);
 			return 1;
 		}
 		
 		data->lines_captured++;
 		if (data->lines_captured > data->max_lines_captured) {
-			debug("process_chunk: captured %d lines, finishing\n", data->lines_captured);
+			fp_dbg("process_chunk: captured %d lines, finishing", data->lines_captured);
 			return 1;
 		}
 		
@@ -589,7 +525,7 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 			memmove(data->lastline, linebuf, VFS5011_LINE_SIZE);
 			data->lines_recorded++;
 			if (data->lines_recorded >= data->max_lines_recorded) {
-				debug("process_chunk: recorded %d lines, finishing\n", data->lines_recorded);
+				fp_dbg("process_chunk: recorded %d lines, finishing", data->lines_recorded);
 				return 1;
 			}
 		}
@@ -599,7 +535,7 @@ static int process_chunk(struct vfs5011_data *data, int transferred)
 
 void save_pgm(const char *filename, unsigned char *data, int width, int height)
 {
-#ifdef DEBUG
+#ifdef ENABLE_DEBUG_LOGGING
 	FILE *f = fopen(filename, "wm");
 	if (f != NULL) {
 		char header[1024];
@@ -619,7 +555,6 @@ void submit_image(struct fpi_ssm *ssm, struct vfs5011_data *data)
 
 	char name[1024];
 	char *debugpath = get_debugfiles_path();
-	FILE *debugfile = NULL;
 	
 	if (debugpath != NULL) {
 		sprintf(name, "%s/total%d.pgm", debugpath, timestamp);
@@ -627,42 +562,13 @@ void submit_image(struct fpi_ssm *ssm, struct vfs5011_data *data)
 
 		sprintf(name, "%s/prescale%d.pgm", debugpath, timestamp);
 		save_pgm(name, data->image_buffer, VFS5011_LINE_SIZE, data->lines_recorded);
-// 		debugfile = fopen(name, "wb");
-// 		if (debugfile != NULL) {
-// 			char header[1024];
-// 			sprintf(header, "P6\n%d %d\n255\n", VFS5011_LINE_SIZE, data->lines_recorded);
-// 			fwrite(header, 1, strlen(header), debugfile);
-// 			for (unsigned i = 0; i < data->lines_recorded * VFS5011_LINE_SIZE; i++) {
-// 				fwrite(&data->image_buffer[i], 1, 1, debugfile);
-// 				fwrite(&data->image_buffer[i], 1, 1, debugfile);
-// 				fwrite(&data->image_buffer[i], 1, 1, debugfile);
-// 			}
-// 			fclose(debugfile);
-// 		}
 	}
 	
 	int height = vfs5011_rescale_image(data->image_buffer, data->lines_recorded,
 	                               data->rescale_buffer, MAXLINES);
-// 	int height = data->lines_recorded;
-// 	int i;
-// 	for (i = 0; i < height; i++)
-// 		memmove(data->rescale_buffer + i*VFS5011_IMAGE_WIDTH,
-// 				data->image_buffer + i*VFS5011_LINE_SIZE + 8, VFS5011_IMAGE_WIDTH);
 	if (debugpath != NULL) {
 		sprintf(name, "%s/image%d.pgm", debugpath, timestamp);
 		save_pgm(name, data->rescale_buffer, VFS5011_IMAGE_WIDTH, height);
-// 		debugfile = fopen(name, "wb");
-// 		if (debugfile != NULL) {
-// 			char header[1024];
-// 			sprintf(header, "P6\n%d %d\n255\n", VFS5011_IMAGE_WIDTH, height);
-// 			fwrite(header, 1, strlen(header), debugfile);
-// 			for (unsigned i = 0; i < height * VFS5011_IMAGE_WIDTH; i++) {
-// 				fwrite(&data->rescale_buffer[i], 1, 1, debugfile);
-// 				fwrite(&data->rescale_buffer[i], 1, 1, debugfile);
-// 				fwrite(&data->rescale_buffer[i], 1, 1, debugfile);
-// 			}
-// 			fclose(debugfile);
-// 		}
 	}
 	
 	struct fp_img *img = fpi_img_new(VFS5011_IMAGE_WIDTH * height);
@@ -676,13 +582,7 @@ void submit_image(struct fpi_ssm *ssm, struct vfs5011_data *data)
 	img->height = height;
 	memmove(img->data, data->rescale_buffer, VFS5011_IMAGE_WIDTH * height);
 	
-	debug("Image captured, commiting\n");
-#ifdef DEBUG
-	if (debuglogfile != NULL) {
-		fclose(debuglogfile);
-		debuglogfile = NULL;
-	}
-#endif
+	fp_dbg("Image captured, commiting");
 
 	fpi_imgdev_image_captured(dev, img);
 
@@ -714,7 +614,7 @@ static void chunk_capture_callback(struct libusb_transfer *transfer)
 static int capture_chunk_async(struct vfs5011_data *data, libusb_device_handle *handle, int nline,
                                int timeout, struct fpi_ssm *ssm)
 {
-	debug("capture_chunk_async: capture %d lines, already have %d\n", nline, data->lines_recorded);
+	fp_dbg("capture_chunk_async: capture %d lines, already have %d", nline, data->lines_recorded);
 	enum {
 		DEVIATION_THRESHOLD = 15*15,
 		DIFFERENCE_THRESHOLD = 600,
@@ -743,7 +643,7 @@ static void main_loop(struct fpi_ssm *ssm)
 	int r;
 	struct fpi_timeout *timeout;
 	
-	debug("main_loop: state %d\n", ssm->cur_state);
+	fp_dbg("main_loop: state %d", ssm->cur_state);
 	
 	switch (ssm->cur_state) {
 	case M_REQUEST_FPRINT:
@@ -779,7 +679,7 @@ static void main_loop(struct fpi_ssm *ssm)
 		break;
 	
 	case M_FINISHED:
-		debug("finishing\n");
+		fp_dbg("finishing");
 		vfs5011_prepare(dev->udev);
 		submit_image(ssm, data);
 		fpi_imgdev_report_finger_status(dev, FALSE);
@@ -790,7 +690,6 @@ static void main_loop(struct fpi_ssm *ssm)
 
 static void main_loop_complete(struct fpi_ssm *ssm)
 {
-// 	debug("completing state machine\n");
 	fpi_ssm_free(ssm);
 }
 
@@ -848,21 +747,20 @@ static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 		fp_err("Failed to initialize the device");
 		return r;
 	}
-	debug("device initialized\n");
+	fp_dbg("device initialized");
 	fpi_imgdev_activate_complete(dev, 0);
-	debug("creating ssm\n");
+	fp_dbg("creating ssm");
 	ssm = fpi_ssm_new(dev->dev, main_loop, M_LOOP_NUM_STATES);
 	ssm->priv = dev;
-	debug("starting ssm\n");
+	fp_dbg("starting ssm");
 	fpi_ssm_start(ssm, main_loop_complete);
-	debug("ssm done, getting out\n");
+	fp_dbg("ssm done, getting out");
 
 	return 0;
 }
 
 static void dev_deactivate(struct fp_img_dev *dev)
 {
-// 	debug("deactivating\n");
 	libusb_release_interface(dev->udev, 0);
 	fpi_imgdev_deactivate_complete(dev);
 }
@@ -870,7 +768,7 @@ static void dev_deactivate(struct fp_img_dev *dev)
 static const struct usb_id id_table[] =
 {
 	{ .vendor = 0x138a, .product = 0x0011 /* vfs5011 */ },
-	{ .vendor = 0x138a, .product = 0x0018 /* vfs5011 */ },
+	{ .vendor = 0x138a, .product = 0x0018 /* one more Validity device */ },
 	{ 0, 0, 0, },
 };
 
@@ -878,7 +776,7 @@ struct fp_img_driver vfs5011_driver =
 {
 	.driver =
 	{
-		.id = 12,
+		.id = VFS5011_ID,
 		.name = "vfs5011",
 		.full_name = "Validity VFS5011",
 		.id_table = id_table,
