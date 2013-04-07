@@ -282,7 +282,7 @@ static void usb_exchange_async(struct fpi_ssm *ssm, struct usbexchange_data *dat
 	fpi_ssm_start_subsm(ssm, subsm);
 }
 
-static void usb_exchange_sync(struct fpi_ssm *ssm, struct usbexchange_data *data)
+static int usb_exchange_sync(struct usbexchange_data *data)
 {
 	for (int i = 0; i < data->stepcount; i++) {
 		struct usb_action *action = &data->actions[i];
@@ -295,17 +295,13 @@ static void usb_exchange_sync(struct fpi_ssm *ssm, struct usbexchange_data *data
 			                           action->size, &transferred, data->timeout);
 			if (ret != 0) {
 				fp_err("USB transfer error: %s", strerror(ret));
-				fpi_imgdev_session_error(data->device, ret);
-				fpi_ssm_mark_aborted(ssm, ret);
-				return;
+				return ret;
 			}
 			if (transferred != action->size) {
 				/* Data sended mismatch with expected, return protocol error */
 				fp_err("length mismatch, got %d, expected %d",
 					transferred, action->size);
-				fpi_imgdev_session_error(data->device, -EIO);
-				fpi_ssm_mark_aborted(ssm, -EIO);
-				return;
+				return -EIO;
 			}
 			break;
 			
@@ -315,38 +311,30 @@ static void usb_exchange_sync(struct fpi_ssm *ssm, struct usbexchange_data *data
 			                           action->size, &transferred, data->timeout);
 			if (ret != 0) {
 				fp_err("USB transfer error: %s", strerror(ret));
-				fpi_imgdev_session_error(data->device, ret);
-				fpi_ssm_mark_aborted(ssm, ret);
-				return;
+				return ret;
 			}
 			if (action->data != NULL) {
 				if (transferred != action->correct_reply_size) {
 					fp_err("Got %d bytes instead of %d", transferred,
 						action->correct_reply_size);
-					fpi_imgdev_session_error(data->device, -EIO);
-					fpi_ssm_mark_aborted(ssm, -EIO);
-					return;
+					return -EIO;
 				}
 				if (memcmp(data->receive_buf, action->data, action->correct_reply_size) != 0) {
 					fp_dbg("Wrong reply:");
 					dump(data->receive_buf, transferred);
-					fpi_imgdev_session_error(data->device, -EIO);
-					fpi_ssm_mark_aborted(ssm, -EIO);
-					return;
+					return -EIO;
 				}
 			} else
-				fp_dbg("Got %d bytes out of %d", transferred
-					data->size);
+				fp_dbg("Got %d bytes out of %d", transferred,
+					action->size);
 			break;
 			
 		default:
 			fp_err("Bug detected: invalid action %d", action->type);
-			fpi_imgdev_session_error(data->device, -EINVAL);
-			fpi_ssm_mark_aborted(ssm, -EINVAL);
-			return;
+			return -EINVAL;
 		}
 	}
-	fpi_ssm_next_state(ssm);
+	return 0;
 }
 
 //====================== utils =======================
@@ -972,7 +960,13 @@ static void activate_loop(struct fpi_ssm *ssm)
 		data->init_sequence.device = dev;
 		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
 		data->init_sequence.timeout = 1000;
-		usb_exchange_sync(ssm, &data->init_sequence);
+		r = usb_exchange_sync(&data->init_sequence);
+		if (r != 0) {
+			fp_err("Failed to initiate the capture");
+			fpi_imgdev_session_error(dev, r);
+			fpi_ssm_mark_aborted(ssm, r);
+		} else
+			fpi_ssm_next_state(ssm);
 		break;
 		
 	case DEV_ACTIVATE_INIT_COMPLETE:
