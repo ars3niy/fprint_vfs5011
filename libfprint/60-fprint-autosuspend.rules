@@ -78,6 +78,7 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0008", ATTRS{dev}=
 
 # Validity VFS5011
 SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0011", ATTRS{dev}=="*", ATTR{power/control}="auto"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0018", ATTRS{dev}=="*", ATTR{power/control}="auto"
 
 # UPEK TouchChip/Eikon Touch 300
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="2015", ATTRS{dev}=="*", ATTR{power/control}="auto"
