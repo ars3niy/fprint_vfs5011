@@ -73,7 +73,7 @@ static void dump(const unsigned char *buf, int size)
 #endif
 }
 
-//====================== async transfer sequence =======================
+//====================== sync/async USB transfer sequence =======================
 
 enum {
 	ACTION_SEND,
@@ -120,6 +120,7 @@ struct usbexchange_data {
 	struct fp_img_dev *device;
 	struct usb_action *actions;
 	void *receive_buf;
+	int timeout;
 };
 
 static void async_send_cb(struct libusb_transfer *transfer)
@@ -165,7 +166,6 @@ out:
 	libusb_free_transfer(transfer);
 }
 
-/* Callback of asynchronous recv */
 static void async_recv_cb(struct libusb_transfer *transfer)
 {
 	struct fpi_ssm *ssm = transfer->user_data;
@@ -230,8 +230,7 @@ static void usbexchange_loop(struct fpi_ssm *ssm)
 	
 	struct usb_action *action = &data->actions[ssm->cur_state];
 	struct libusb_transfer *transfer;
-	int ret;
-	enum {BULK_TIMEOUT = 5000};
+	int ret = -EINVAL;
 	
 	switch (action->type) {
 	case ACTION_SEND:
@@ -244,7 +243,7 @@ static void usbexchange_loop(struct fpi_ssm *ssm)
 			return;
 		}
 		libusb_fill_bulk_transfer(transfer, data->device->udev, action->endpoint, action->data,
-		                          action->size, async_send_cb, ssm, BULK_TIMEOUT);
+		                          action->size, async_send_cb, ssm, data->timeout);
 		ret = libusb_submit_transfer(transfer);
 		break;
 		
@@ -258,7 +257,7 @@ static void usbexchange_loop(struct fpi_ssm *ssm)
 			return;
 		}
 		libusb_fill_bulk_transfer(transfer, data->device->udev, action->endpoint, data->receive_buf,
-		                          action->size, async_recv_cb, ssm, BULK_TIMEOUT);
+		                          action->size, async_recv_cb, ssm, data->timeout);
 		ret = libusb_submit_transfer(transfer);
 		break;
 		
@@ -281,6 +280,73 @@ static void usb_exchange_async(struct fpi_ssm *ssm, struct usbexchange_data *dat
 	struct fpi_ssm *subsm = fpi_ssm_new(data->device->dev, usbexchange_loop, data->stepcount);
 	subsm->priv = data;
 	fpi_ssm_start_subsm(ssm, subsm);
+}
+
+static void usb_exchange_sync(struct fpi_ssm *ssm, struct usbexchange_data *data)
+{
+	for (int i = 0; i < data->stepcount; i++) {
+		struct usb_action *action = &data->actions[i];
+		int ret = -EINVAL;
+		int transferred = 0;
+		switch (action->type) {
+		case ACTION_SEND:
+			fp_dbg("Sending %s", action->name);
+			ret = libusb_bulk_transfer(data->device->udev, action->endpoint, action->data,
+			                           action->size, &transferred, data->timeout);
+			if (ret != 0) {
+				fp_err("USB transfer error: %s", strerror(ret));
+				fpi_imgdev_session_error(data->device, ret);
+				fpi_ssm_mark_aborted(ssm, ret);
+				return;
+			}
+			if (transferred != action->size) {
+				/* Data sended mismatch with expected, return protocol error */
+				fp_err("length mismatch, got %d, expected %d",
+					transferred, action->size);
+				fpi_imgdev_session_error(data->device, -EIO);
+				fpi_ssm_mark_aborted(ssm, -EIO);
+				return;
+			}
+			break;
+			
+		case ACTION_RECEIVE:
+			fp_dbg("Receiving %d bytes", action->size);
+			ret = libusb_bulk_transfer(data->device->udev, action->endpoint, data->receive_buf,
+			                           action->size, &transferred, data->timeout);
+			if (ret != 0) {
+				fp_err("USB transfer error: %s", strerror(ret));
+				fpi_imgdev_session_error(data->device, ret);
+				fpi_ssm_mark_aborted(ssm, ret);
+				return;
+			}
+			if (action->data != NULL) {
+				if (transferred != action->correct_reply_size) {
+					fp_err("Got %d bytes instead of %d", transferred,
+						action->correct_reply_size);
+					fpi_imgdev_session_error(data->device, -EIO);
+					fpi_ssm_mark_aborted(ssm, -EIO);
+					return;
+				}
+				if (memcmp(data->receive_buf, action->data, action->correct_reply_size) != 0) {
+					fp_dbg("Wrong reply:");
+					dump(data->receive_buf, transferred);
+					fpi_imgdev_session_error(data->device, -EIO);
+					fpi_ssm_mark_aborted(ssm, -EIO);
+					return;
+				}
+			} else
+				fp_dbg("Got %d bytes out of %d", transferred
+					data->size);
+			break;
+			
+		default:
+			fp_err("Bug detected: invalid action %d", action->type);
+			fpi_imgdev_session_error(data->device, -EINVAL);
+			fpi_ssm_mark_aborted(ssm, -EINVAL);
+			return;
+		}
+	}
+	fpi_ssm_next_state(ssm);
 }
 
 //====================== utils =======================
@@ -510,14 +576,18 @@ struct vfs5011_data {
 };
 
 enum {
-	M_REQUEST_FPRINT,
-	M_INIT_COMPLETE,
-	M_CAPTURE_READY,
-	M_READ_DATA,
-	M_DATA_COMPLETE,
-	M_PREPARE_NEXT_CAPTURE,
-	M_FINISHED,
-	M_LOOP_NUM_STATES
+	DEV_ACTIVATE_REQUEST_FPRINT,
+	DEV_ACTIVATE_INIT_COMPLETE,
+	DEV_ACTIVATE_READ_DATA,
+	DEV_ACTIVATE_DATA_COMPLETE,
+	DEV_ACTIVATE_PREPARE_NEXT_CAPTURE,
+	DEV_ACTIVATE_NUM_STATES
+};
+
+enum {
+	DEV_OPEN_START,
+// 	DEV_OPEN_INIT_COMPLETE,
+	DEV_OPEN_NUM_STATES
 };
 
 static void capture_init(struct vfs5011_data *data, int max_captured, int max_recorded)
@@ -697,9 +767,9 @@ static void chunk_capture_callback(struct libusb_transfer *transfer)
 			fpi_imgdev_report_finger_status(dev, TRUE);
 		
 		if (process_chunk(data, transfer->actual_length))
-			fpi_ssm_jump_to_state(ssm, M_DATA_COMPLETE);
+			fpi_ssm_jump_to_state(ssm, DEV_ACTIVATE_DATA_COMPLETE);
 		else
-			fpi_ssm_jump_to_state(ssm, M_READ_DATA);
+			fpi_ssm_jump_to_state(ssm, DEV_ACTIVATE_READ_DATA);
 	} else {
 		fp_err("Failed to capture data");
 		fpi_ssm_mark_aborted(ssm, -1);
@@ -884,7 +954,7 @@ struct usb_action vfs5011_initiate_capture[] = {
 
 //====================== lifprint interface =======================
 
-static void main_loop(struct fpi_ssm *ssm)
+static void activate_loop(struct fpi_ssm *ssm)
 {
 	enum {READ_TIMEOUT = 0};
 	
@@ -896,28 +966,24 @@ static void main_loop(struct fpi_ssm *ssm)
 	debug("main_loop: state %d", ssm->cur_state);
 	
 	switch (ssm->cur_state) {
-	case M_REQUEST_FPRINT:
-		data->init_sequence.stepcount = array_n_elements(vfs5011_initialization);
-		data->init_sequence.actions = vfs5011_initialization;
-		data->init_sequence.device = dev;
-		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
-		usb_exchange_async(ssm, &data->init_sequence);
-		break;
-	
-	case M_INIT_COMPLETE:
+	case DEV_ACTIVATE_REQUEST_FPRINT:
 		data->init_sequence.stepcount = array_n_elements(vfs5011_initiate_capture);
 		data->init_sequence.actions = vfs5011_initiate_capture;
-		usb_exchange_async(ssm, &data->init_sequence);
+		data->init_sequence.device = dev;
+		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
+		data->init_sequence.timeout = 1000;
+		usb_exchange_sync(ssm, &data->init_sequence);
 		break;
 		
-	case M_CAPTURE_READY:
+	case DEV_ACTIVATE_INIT_COMPLETE:
 		free(data->init_sequence.receive_buf);
 		data->init_sequence.receive_buf = NULL;
 		capture_init(data, MAX_CAPTURE_LINES, MAXLINES);
+		fpi_imgdev_activate_complete(dev, 0);
 		fpi_ssm_next_state(ssm);
 		break;
 
-	case M_READ_DATA:
+	case DEV_ACTIVATE_READ_DATA:
 		r = capture_chunk_async(data, dev->udev, CAPTURE_LINES, READ_TIMEOUT, ssm);
 		if (r != 0) {
 			fp_err("Failed to capture data");
@@ -926,7 +992,7 @@ static void main_loop(struct fpi_ssm *ssm)
 		}
 		break;
 	
-	case M_DATA_COMPLETE:
+	case DEV_ACTIVATE_DATA_COMPLETE:
 		timeout = fpi_timeout_add(1, async_sleep_cb, ssm);
 
 		if (timeout == NULL) {
@@ -937,28 +1003,64 @@ static void main_loop(struct fpi_ssm *ssm)
 		}
 		break;
 	
-	case M_PREPARE_NEXT_CAPTURE:
+	case DEV_ACTIVATE_PREPARE_NEXT_CAPTURE:
 		data->init_sequence.stepcount = array_n_elements(vfs5011_initiate_capture);
 		data->init_sequence.actions = vfs5011_initiate_capture;
 		data->init_sequence.device = dev;
 		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
+		data->init_sequence.timeout = VFS5011_DEFAULT_WAIT_TIMEOUT;
 		usb_exchange_async(ssm, &data->init_sequence);
 		break;
 	
-	case M_FINISHED:
-		fp_dbg("finishing");
-		free(data->init_sequence.receive_buf);
-		data->init_sequence.receive_buf = NULL;
-		submit_image(ssm, data);
-		fpi_imgdev_report_finger_status(dev, FALSE);
-		fpi_ssm_mark_completed(ssm);
-		break;
 	}
 }
 
-static void main_loop_complete(struct fpi_ssm *ssm)
+static void activate_loop_complete(struct fpi_ssm *ssm)
 {
-// 	debug("completing state machine");
+	struct fp_img_dev *dev = (struct fp_img_dev *)ssm->priv;
+	struct vfs5011_data *data = (struct vfs5011_data *)dev->priv;
+
+	fp_dbg("finishing");
+	free(data->init_sequence.receive_buf);
+	data->init_sequence.receive_buf = NULL;
+	submit_image(ssm, data);
+	fpi_imgdev_report_finger_status(dev, FALSE);
+	
+	fpi_ssm_free(ssm);
+}
+
+static void open_loop(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *dev = (struct fp_img_dev *)ssm->priv;
+	struct vfs5011_data *data = (struct vfs5011_data *)dev->priv;
+
+	switch (ssm->cur_state) {
+	case DEV_OPEN_START:
+		data->init_sequence.stepcount = array_n_elements(vfs5011_initialization);
+		data->init_sequence.actions = vfs5011_initialization;
+		data->init_sequence.device = dev;
+		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
+		data->init_sequence.timeout = VFS5011_DEFAULT_WAIT_TIMEOUT;
+		usb_exchange_async(ssm, &data->init_sequence);
+		break;
+		
+	/*case DEV_OPEN_INIT_COMPLETE:
+		data->init_sequence.stepcount = array_n_elements(vfs5011_initiate_capture);
+		data->init_sequence.actions = vfs5011_initiate_capture;
+		usb_exchange_async(ssm, &data->init_sequence);
+		break;*/
+	};
+}
+
+static void open_loop_complete(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *dev = (struct fp_img_dev *)ssm->priv;
+	struct vfs5011_data *data = (struct vfs5011_data *)dev->priv;
+	
+	free(data->init_sequence.receive_buf);
+	data->init_sequence.receive_buf = NULL;
+	
+	fpi_imgdev_open_complete(dev, 0);
 	fpi_ssm_free(ssm);
 }
 
@@ -977,13 +1079,30 @@ static int dev_open(struct fp_img_dev *dev, unsigned long driver_data)
 	dev->priv = data;
 
 	dev->dev->nr_enroll_stages = 1;
-	fpi_imgdev_open_complete(dev, 0);
+	
+	int r = libusb_reset_device(dev->udev);
+	if (r != 0) {
+		fp_err("Failed to reset the device");
+		return r;
+	}
+	
+	r = libusb_claim_interface(dev->udev, 0);
+	if (r != 0) {
+		fp_err("Failed to claim interface");
+		return r;
+	}
+	
+	struct fpi_ssm *ssm;
+	ssm = fpi_ssm_new(dev->dev, open_loop, DEV_OPEN_NUM_STATES);
+	ssm->priv = dev;
+	fpi_ssm_start(ssm, open_loop_complete);
 
 	return 0;
 }
 
 static void dev_close(struct fp_img_dev *dev)
 {
+	libusb_release_interface(dev->udev, 0);
 	struct vfs5011_data *data = (struct vfs5011_data *)dev->priv;
 	if (data != NULL) {
 		free(data->capture_buffer);
@@ -997,40 +1116,20 @@ static void dev_close(struct fp_img_dev *dev)
 static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 {
 	struct fpi_ssm *ssm;
-	int r;
 	
-	r = libusb_reset_device(dev->udev);
-	if (r != 0) {
-		fp_err("Failed to reset the device");
-		return r;
-	}
-	
-	r = libusb_claim_interface(dev->udev, 0);
-	if (r != 0) {
-		fp_err("Failed to claim interface");
-		return r;
-	}
-	
-	if (r != 0) {
-		fp_err("Failed to initialize the device");
-		return r;
-	}
-	debug("device initialized");
-	fpi_imgdev_activate_complete(dev, 0);
-	debug("creating ssm");
-	ssm = fpi_ssm_new(dev->dev, main_loop, M_LOOP_NUM_STATES);
+	fp_dbg("device initialized");
+	fp_dbg("creating ssm");
+	ssm = fpi_ssm_new(dev->dev, activate_loop, DEV_ACTIVATE_NUM_STATES);
 	ssm->priv = dev;
-	debug("starting ssm");
-	fpi_ssm_start(ssm, main_loop_complete);
-	debug("ssm done, getting out");
+	fp_dbg("starting ssm");
+	fpi_ssm_start(ssm, activate_loop_complete);
+	fp_dbg("ssm done, getting out");
 
 	return 0;
 }
 
 static void dev_deactivate(struct fp_img_dev *dev)
 {
-// 	debug("deactivating");
-	libusb_release_interface(dev->udev, 0);
 	fpi_imgdev_deactivate_complete(dev);
 }
 
