@@ -678,7 +678,7 @@ static void chunk_capture_callback(struct libusb_transfer *transfer)
 static int capture_chunk_async(struct vfs5011_data *data, libusb_device_handle *handle, int nline,
                                int timeout, struct fpi_ssm *ssm)
 {
-	printf("capture_chunk_async: capture %d lines, already have %d\n", nline, data->lines_recorded);
+	fp_dbg("capture_chunk_async: capture %d lines, already have %d", nline, data->lines_recorded);
 	enum {
 		DEVIATION_THRESHOLD = 15*15,
 		DIFFERENCE_THRESHOLD = 600,
