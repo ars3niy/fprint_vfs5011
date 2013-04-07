@@ -1045,7 +1045,7 @@ struct fp_img_driver vfs5011_driver =
 {
 	.driver =
 	{
-		.id = 12,
+		.id = VFS5011_ID,
 		.name = "vfs5011",
 		.full_name = "Validity VFS5011",
 		.id_table = id_table,
