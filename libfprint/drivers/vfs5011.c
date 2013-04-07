@@ -6,6 +6,7 @@
 #include <libusb.h>
 #include <unistd.h>
 #include <fp_internal.h>
+#include <errno.h>
 #include "driver_ids.h"
 
 #include "vfs5011_proto.h"
@@ -34,228 +35,217 @@ static void dump(const unsigned char *buf, int size)
 #endif
 }
 
-static int usb_send(libusb_device_handle *handle, unsigned char *data, unsigned size)
+//====================== async transfer sequence =======================
+
+enum {
+	ACTION_SEND,
+	ACTION_RECEIVE,
+};
+
+struct usb_action {
+	int type;
+	const char *name;
+	int endpoint;
+	int size;
+	unsigned char *data;
+	int correct_reply_size;
+};
+
+#define SEND(ENDPOINT, COMMAND) \
+{ \
+	.type = ACTION_SEND, \
+	.endpoint = ENDPOINT, \
+	.name = #COMMAND, \
+	.size = sizeof(COMMAND), \
+	.data = COMMAND \
+},
+
+#define RECV(ENDPOINT, SIZE) \
+{ \
+	.type = ACTION_RECEIVE, \
+	.endpoint = ENDPOINT, \
+	.size = SIZE, \
+	.data = NULL \
+},
+
+#define RECV_CHECK(ENDPOINT, SIZE, EXPECTED) \
+{ \
+	.type = ACTION_RECEIVE, \
+	.endpoint = ENDPOINT, \
+	.size = SIZE, \
+	.data = EXPECTED, \
+	.correct_reply_size = sizeof(EXPECTED) \
+},
+
+struct usbexchange_data {
+	int stepcount;
+	struct fp_img_dev *device;
+	struct usb_action *actions;
+	void *receive_buf;
+};
+
+static void async_send_cb(struct libusb_transfer *transfer)
 {
-	int transferred = 0;
-	int r = libusb_bulk_transfer(handle, VFS5011_OUT_ENDPOINT, data, size,
-	                                    &transferred, VFS5011_DEFAULT_WAIT_TIMEOUT);
-	if (r < 0) {
-		fp_dbg("usb_send: bulk transfer returned %d", r);
-		return r;
+	struct fpi_ssm *ssm = transfer->user_data;
+	struct usbexchange_data *data = (struct usbexchange_data *)ssm->priv;
+
+	if (ssm->cur_state >= data->stepcount) {
+		fp_err("Radiation detected!");
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		goto out;
 	}
 	
-	if (transferred != size) {
-		fp_dbg("usb_send: transfered %d out of %d", transferred, size);
-		return -1;
-	}
-	fp_dbg("size=%d transferred = %d", size, transferred);
-	return 0;
-}
-
-static int usb_recv(libusb_device_handle *handle, unsigned endpoint, unsigned char *buf,
-             unsigned max_bytes, int *transferred)
-{
-	int r = libusb_bulk_transfer(handle, endpoint, buf, max_bytes, transferred,
-	                             VFS5011_DEFAULT_WAIT_TIMEOUT);
-	if (r < 0) {
-		fp_dbg("usb_recv: bulk transfer returned %d", r);
-		return r;
-	}
-	fp_dbg("usb_recv: got %d out of %d", *transferred, max_bytes);
-	return 0;
-}
-
-#define SEND(command) \
-	fp_dbg("Sending " #command ""); \
-	if (usb_send(handle, command, sizeof(command)) != 0) { \
-		fp_dbg(#command " failed"); \
-		return -1; \
+	struct usb_action *action = &data->actions[ssm->cur_state];
+	if (action->type != ACTION_SEND) {
+		fp_err("Radiation detected!");
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		goto out;
 	}
 
-#define RECV(endpoint, size) \
-	fp_dbg("Receiving %d bytes", size); \
-	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		fp_dbg("Failed to receive " #size " from " #endpoint ""); \
-		return -1; \
-	} \
+	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		/* Transfer not completed, return IO error */
+		fp_err("transfer not completed, status = %d", transfer->status);
+		fpi_imgdev_session_error(data->device, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+		goto out;
+	}
+	if (transfer->length != transfer->actual_length) {
+		/* Data sended mismatch with expected, return protocol error */
+		fp_err("length mismatch, got %d, expected %d",
+			transfer->actual_length, transfer->length);
+		fpi_imgdev_session_error(data->device, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+		goto out;
+	}
+	
+	//success
+	fpi_ssm_next_state(ssm);
 
-#define RECV_CHECK(endpoint, size, expected) \
-	fp_dbg("Receiving %d bytes", size); \
-	if (usb_recv(handle, endpoint, receive_buf, size, &received) != 0) { \
-		fp_dbg("Failed to receive " #size " from " #endpoint ""); \
-		return -1; \
-	} \
-	if ( (received != sizeof(expected)) || \
-	     (memcmp(receive_buf, expected, sizeof(expected)) != 0) ) { \
-		fp_dbg("Receiving " #size " from " #endpoint " got wrong reply:"); \
-		dump(receive_buf, received); \
-		return -1; \
-	} else \
-		fp_dbg("Receiving " #size " from " #endpoint " correct reply");
-
-// This is done when the device is plugged in, but it doesn't harm
-// to do this every time before scanning the image
-int vfs5011_init(libusb_device_handle *handle)
-{
-	unsigned char receive_buf[VFS5011_RECEIVE_BUF_SIZE];
-	int received = 0;
-
-	SEND(vfs5011_cmd_01);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	
-	SEND(vfs5011_cmd_19);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64); //B5C457F9
-	
-	SEND(vfs5011_init_00);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64); //0000FFFFFFFF
-	
-	SEND(vfs5011_init_01);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64); //0000FFFFFFFFFF
-	
-	SEND(vfs5011_init_02);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_cmd_01);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_03);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_04);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 256);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 64);
-	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_05);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_cmd_01);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	
-	SEND(vfs5011_init_06);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 17216);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 32);
-	
-	SEND(vfs5011_init_07);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 45056);
-	
-	SEND(vfs5011_init_08);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 16896);
-	
-	SEND(vfs5011_init_09);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 4928);
-	
-	SEND(vfs5011_init_10);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 5632);
-	
-	SEND(vfs5011_init_11);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 5632);
-	
-	SEND(vfs5011_init_12);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 3328);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 64);
-	
-	SEND(vfs5011_init_13);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_03);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_14);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	RECV(VFS5011_IN_ENDPOINT_DATA, 4800);
-	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_02);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_cmd_27);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_15);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_16);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 2368);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 4800);
-	
-	SEND(vfs5011_init_17);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	SEND(vfs5011_init_18);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY); //0000
-	
-	// Windows driver does this and it works
-	// But in this driver this call never returns...
-	// RECV(VFS5011_IN_ENDPOINT_CTRL2, 8); //00D3054000
-	
-	return 0;
+out:
+	libusb_free_transfer(transfer);
 }
 
-// Initiate recording the image
-int vfs5011_prepare(libusb_device_handle *handle)
+/* Callback of asynchronous recv */
+static void async_recv_cb(struct libusb_transfer *transfer)
 {
-	unsigned char receive_buf[VFS5011_RECEIVE_BUF_SIZE];
-	int received = 0;
+	struct fpi_ssm *ssm = transfer->user_data;
+	struct usbexchange_data *data = (struct usbexchange_data *)ssm->priv;
 
-	SEND(vfs5011_cmd_04);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 64);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 84032);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
+	if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		/* Transfer not completed, return IO error */
+		fp_err("transfer not completed, status = %d", transfer->status);
+		fpi_imgdev_session_error(data->device, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+		goto out;
+	} 
+
+	if (ssm->cur_state >= data->stepcount) {
+		fp_err("Radiation detected!");
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		goto out;
+	}
 	
+	struct usb_action *action = &data->actions[ssm->cur_state];
+	if (action->type != ACTION_RECEIVE) {
+		fp_err("Radiation detected!");
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		goto out;
+	}
 	
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
-	
-	SEND(vfs5011_prepare_00);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
+	if (action->data != NULL) {
+		if (transfer->actual_length != action->correct_reply_size) {
+			fp_err("Got %d bytes instead of %d", transfer->actual_length,
+			       action->correct_reply_size);
+			fpi_imgdev_session_error(data->device, -EIO);
+			fpi_ssm_mark_aborted(ssm, -EIO);
+			goto out;
+		}
+		if (memcmp(transfer->buffer, action->data, action->correct_reply_size) != 0) {
+			fp_dbg("Wrong reply:");
+			dump(data->receive_buf, transfer->actual_length);
+			fpi_imgdev_session_error(data->device, -EIO);
+			fpi_ssm_mark_aborted(ssm, -EIO);
+			goto out;
+		}
+	} else
+		fp_dbg("Got %d bytes out of %d", transfer->actual_length,
+		       transfer->length);
 
-	SEND(vfs5011_cmd_1A);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
-
-	SEND(vfs5011_prepare_01);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
-
-	SEND(vfs5011_prepare_02);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 2368);
-	RECV(VFS5011_IN_ENDPOINT_CTRL, 64);
-	RECV(VFS5011_IN_ENDPOINT_DATA, 4800);
-
-	SEND(vfs5011_prepare_03);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY);
-	usb_recv(handle, VFS5011_IN_ENDPOINT_CTRL2, receive_buf, 8, &received);
-
-	SEND(vfs5011_prepare_04);
-	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 2368, VFS5011_NORMAL_CONTROL_REPLY);
-
-	// Windows driver does this and it works
-	// But in this driver this call never returns...
-	// usb_recv(handle, VFS5011_IN_ENDPOINT_CTRL2, receive_buf, 8, &received);
-	return 0;
+	fpi_ssm_next_state(ssm);
+out:
+	libusb_free_transfer(transfer);
 }
+
+static void usbexchange_loop(struct fpi_ssm *ssm)
+{
+	struct usbexchange_data *data = (struct usbexchange_data *)ssm->priv;
+	if (ssm->cur_state >= data->stepcount) {
+		fp_err("Bug detected: state %d out of range, only %d steps", ssm->cur_state, data->stepcount);
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		return;
+	}
+	
+	struct usb_action *action = &data->actions[ssm->cur_state];
+	struct libusb_transfer *transfer;
+	int ret;
+	enum {BULK_TIMEOUT = 5000};
+	
+	switch (action->type) {
+	case ACTION_SEND:
+		fp_dbg("Sending %s", action->name);
+		transfer = libusb_alloc_transfer(0);
+		if (transfer == NULL) {
+			fp_err("Failed to allocate transfer");
+			fpi_imgdev_session_error(data->device, -ENOMEM);
+			fpi_ssm_mark_aborted(ssm, -ENOMEM);
+			return;
+		}
+		libusb_fill_bulk_transfer(transfer, data->device->udev, action->endpoint, action->data,
+		                          action->size, async_send_cb, ssm, BULK_TIMEOUT);
+		ret = libusb_submit_transfer(transfer);
+		break;
+		
+	case ACTION_RECEIVE:
+		fp_dbg("Receiving %d bytes", action->size);
+		transfer = libusb_alloc_transfer(0);
+		if (transfer == NULL) {
+			fp_err("Failed to allocate transfer");
+			fpi_imgdev_session_error(data->device, -ENOMEM);
+			fpi_ssm_mark_aborted(ssm, -ENOMEM);
+			return;
+		}
+		libusb_fill_bulk_transfer(transfer, data->device->udev, action->endpoint, data->receive_buf,
+		                          action->size, async_recv_cb, ssm, BULK_TIMEOUT);
+		ret = libusb_submit_transfer(transfer);
+		break;
+		
+	default:
+		fp_err("Bug detected: invalid action %d", action->type);
+		fpi_imgdev_session_error(data->device, -EINVAL);
+		fpi_ssm_mark_aborted(ssm, -EINVAL);
+		return;
+	}
+	
+	if (ret != 0) {
+		fp_err("USB transfer error: %s", strerror(ret));
+		fpi_imgdev_session_error(data->device, ret);
+		fpi_ssm_mark_aborted(ssm, ret);
+	}
+}
+
+static void usb_exchange_async(struct fpi_ssm *ssm, struct usbexchange_data *data)
+{
+	struct fpi_ssm *subsm = fpi_ssm_new(data->device->dev, usbexchange_loop, data->stepcount);
+	subsm->priv = data;
+	fpi_ssm_start_subsm(ssm, subsm);
+}
+
+//====================== utils =======================
 
 #if VFS5011_LINE_SIZE > INT_MAX/(256*256)
 #error We might get integer overflow while computing standard deviation!
@@ -434,7 +424,7 @@ int vfs5011_rescale_image(unsigned char *image, int input_lines,
 	return line_ind;
 }
 
-//====================== lifprint interface =======================
+//====================== main stuff =======================
 
 enum {
 	CAPTURE_LINES = 256,
@@ -451,12 +441,16 @@ struct vfs5011_data {
 	int lines_captured, lines_recorded, empty_lines;
 	int max_lines_captured, max_lines_recorded;
 	int lines_total, lines_total_allocated;
+	struct usbexchange_data init_sequence;
 };
 
 enum {
 	M_REQUEST_FPRINT,
+	M_INIT_COMPLETE,
+	M_CAPTURE_READY,
 	M_READ_DATA,
 	M_DATA_COMPLETE,
+	M_PREPARE_NEXT_CAPTURE,
 	M_FINISHED,
 	M_LOOP_NUM_STATES
 };
@@ -634,6 +628,160 @@ static void async_sleep_cb(void *data)
 	fpi_ssm_next_state(ssm);
 }
 
+// Device initialization. Windows driver only does it when the device is plugged
+// in, but it doesn't harm to do this every time before scanning the image
+struct usb_action vfs5011_initialization[] = {
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_01)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_19)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64) //B5C457F9
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_00)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64) //0000FFFFFFFF
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_01)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64) //0000FFFFFFFFFF
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_02)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_01)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_03)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_04)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 256)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_05)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_01)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_06)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 17216)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 32)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_07)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 45056)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_08)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 16896)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_09)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 4928)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_10)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 5632)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_11)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 5632)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_12)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 3328)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_13)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_03)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_14)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	RECV(VFS5011_IN_ENDPOINT_DATA, 4800)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_02)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_27)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_15)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_16)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 2368)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 4800)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_17)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_init_18)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY) //0000
+	
+	// Windows driver does this and it works
+	// But in this driver this call never returns...
+	// RECV(VFS5011_IN_ENDPOINT_CTRL2, 8) //00D3054000
+};
+
+// Initiate recording the image
+struct usb_action vfs5011_initiate_capture[] = {
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_04)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 64)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 84032)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+	
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_prepare_00)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_cmd_1A)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_prepare_01)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_prepare_02)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 2368)
+	RECV(VFS5011_IN_ENDPOINT_CTRL, 64)
+	RECV(VFS5011_IN_ENDPOINT_DATA, 4800)
+
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_prepare_03)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 64, VFS5011_NORMAL_CONTROL_REPLY)
+	RECV(VFS5011_IN_ENDPOINT_CTRL2, 8)
+
+	SEND(VFS5011_OUT_ENDPOINT, vfs5011_prepare_04)
+	RECV_CHECK(VFS5011_IN_ENDPOINT_CTRL, 2368, VFS5011_NORMAL_CONTROL_REPLY)
+
+	// Windows driver does this and it works
+	// But in this driver this call never returns...
+	// RECV(VFS5011_IN_ENDPOINT_CTRL2, 8);
+};
+
+//====================== lifprint interface =======================
+
 static void main_loop(struct fpi_ssm *ssm)
 {
 	enum {READ_TIMEOUT = 0};
@@ -647,15 +795,24 @@ static void main_loop(struct fpi_ssm *ssm)
 	
 	switch (ssm->cur_state) {
 	case M_REQUEST_FPRINT:
-		r = vfs5011_prepare(dev->udev);
-		if (r == 0) {
-			capture_init(data, MAX_CAPTURE_LINES, MAXLINES);
-			fpi_ssm_next_state(ssm);
-		} else {
-			fp_err("Failed to initiate scan");
-			fpi_imgdev_session_error(dev, r);
-			fpi_ssm_mark_aborted(ssm, r);
-		}
+		data->init_sequence.stepcount = array_n_elements(vfs5011_initialization);
+		data->init_sequence.actions = vfs5011_initialization;
+		data->init_sequence.device = dev;
+		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
+		usb_exchange_async(ssm, &data->init_sequence);
+		break;
+	
+	case M_INIT_COMPLETE:
+		data->init_sequence.stepcount = array_n_elements(vfs5011_initiate_capture);
+		data->init_sequence.actions = vfs5011_initiate_capture;
+		usb_exchange_async(ssm, &data->init_sequence);
+		break;
+		
+	case M_CAPTURE_READY:
+		free(data->init_sequence.receive_buf);
+		data->init_sequence.receive_buf = NULL;
+		capture_init(data, MAX_CAPTURE_LINES, MAXLINES);
+		fpi_ssm_next_state(ssm);
 		break;
 
 	case M_READ_DATA:
@@ -678,9 +835,18 @@ static void main_loop(struct fpi_ssm *ssm)
 		}
 		break;
 	
+	case M_PREPARE_NEXT_CAPTURE:
+		data->init_sequence.stepcount = array_n_elements(vfs5011_initiate_capture);
+		data->init_sequence.actions = vfs5011_initiate_capture;
+		data->init_sequence.device = dev;
+		data->init_sequence.receive_buf = malloc(VFS5011_RECEIVE_BUF_SIZE);
+		usb_exchange_async(ssm, &data->init_sequence);
+		break;
+	
 	case M_FINISHED:
 		fp_dbg("finishing");
-		vfs5011_prepare(dev->udev);
+		free(data->init_sequence.receive_buf);
+		data->init_sequence.receive_buf = NULL;
 		submit_image(ssm, data);
 		fpi_imgdev_report_finger_status(dev, FALSE);
 		fpi_ssm_mark_completed(ssm);
@@ -742,7 +908,6 @@ static int dev_activate(struct fp_img_dev *dev, enum fp_imgdev_state state)
 		return r;
 	}
 	
-	r = vfs5011_init(dev->udev);
 	if (r != 0) {
 		fp_err("Failed to initialize the device");
 		return r;
